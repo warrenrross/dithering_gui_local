@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyw.lnk
+
+# Environments
+venv/
+.venv/
+env/
+.env
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Large binaries
+*.dmg
+*.pkg
+*.iso
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
