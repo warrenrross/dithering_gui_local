@@ -1,10 +1,64 @@
 import os
 import queue
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from PIL import Image, ImageTk, ImageOps
 import numpy as np
+
+try:
+    import numba
+    _NUMBA = True
+
+    @numba.njit(cache=True, nogil=True)
+    def _process_row_exact(buf, out_row, y, levels, dxdy, weights, h, w):
+        """JIT-compiled per-pixel diffusion for one row — exact same-row propagation."""
+        for x in range(w):
+            old = buf[y, x]
+            new_val = np.floor(old * levels + 0.5) / levels
+            err = old - new_val
+            out_row[x] = new_val
+            for k in range(dxdy.shape[0]):
+                nx = x + dxdy[k, 0]
+                ny = y + dxdy[k, 1]
+                if 0 <= nx < w and 0 <= ny < h:
+                    buf[ny, nx] += err * weights[k]
+
+except ImportError:
+    _NUMBA = False
+
+
+def diffuse_channel_exact(channel, algo_name, bins, cancel_event=None, progress_fn=None):
+    """Error diffusion with exact same-row propagation (Numba) or fast approximation fallback."""
+    if not _NUMBA:
+        return diffuse_channel_fast(channel, algo_name, bins, cancel_event, progress_fn)
+
+    kernel = ALGORITHMS[algo_name]
+    dxdy    = np.array([[dx, dy] for dx, dy, _ in kernel["offsets"]], dtype=np.int32)
+    weights = np.array([w / kernel["divisor"] for *_, w in kernel["offsets"]], dtype=np.float32)
+
+    buf = channel.astype(np.float32) / 255.0
+    out = np.empty_like(buf)
+    h, w = buf.shape
+    levels = np.float32(max(2, int(bins)) - 1)
+
+    for y in range(h):
+        if cancel_event is not None and cancel_event.is_set():
+            return None
+        if progress_fn is not None:
+            progress_fn(y, h)
+        _process_row_exact(buf, out[y], y, levels, dxdy, weights, h, w)
+
+    return np.clip(out * 255.0 + 0.5, 0, 255).astype(np.uint8)
+
+
+def _prewarm_numba():
+    """Trigger Numba JIT compilation on a tiny array so first real dither is instant."""
+    if not _NUMBA:
+        return
+    dummy = np.full((4, 4), 128, dtype=np.uint8)
+    diffuse_channel_exact(dummy, "Floyd-Steinberg", 2)
 
 ALGORITHMS = {
     "Floyd-Steinberg": {
@@ -71,22 +125,50 @@ def diffuse_channel_fast(channel, algo_name, bins, cancel_event=None, progress_f
 
 
 def dither_image(image, grayscale, bins, algo_name, cancel_event=None, progress_fn=None):
-    """Dither a PIL Image. Returns PIL Image, or None if cancelled."""
+    """Dither a PIL Image. Returns PIL Image, or None if cancelled.
+
+    Grayscale: single channel, sequential.
+    Color: R/G/B processed in parallel via ThreadPoolExecutor; progress is
+    thread-safe via a shared row counter protected by a lock.
+    """
     if grayscale:
         channel = np.array(ImageOps.grayscale(image), dtype=np.uint8)
-        out = diffuse_channel_fast(channel, algo_name, bins, cancel_event, progress_fn)
+        out = diffuse_channel_exact(channel, algo_name, bins, cancel_event, progress_fn)
         return None if out is None else Image.fromarray(out)
 
     arr = np.array(image.convert("RGB"), dtype=np.uint8)
-    channels = []
-    for i in range(3):
-        ch_fn = (None if progress_fn is None
-                 else (lambda y, h, _i=i: progress_fn(_i * h + y, 3 * h)))
-        out = diffuse_channel_fast(arr[:, :, i], algo_name, bins, cancel_event, ch_fn)
-        if out is None:
+    h = arr.shape[0]
+    total = 3 * h
+
+    # Thread-safe row counter: each channel increments it once per scanline.
+    if progress_fn is not None:
+        _lock = threading.Lock()
+        _tally = [0]
+        def _make_ch_fn():
+            def _fn(_y, _h):
+                with _lock:
+                    _tally[0] += 1
+                    progress_fn(_tally[0], total)
+            return _fn
+    else:
+        def _make_ch_fn():
             return None
-        channels.append(out)
-    return Image.fromarray(np.stack(channels, axis=-1))
+
+    results = [None, None, None]
+
+    def _process(i):
+        return diffuse_channel_exact(
+            arr[:, :, i].copy(), algo_name, bins, cancel_event, _make_ch_fn())
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = [executor.submit(_process, i) for i in range(3)]
+        for i, fut in enumerate(futures):
+            result = fut.result()
+            if result is None:
+                return None          # cancelled; executor waits for others to exit
+            results[i] = result
+
+    return Image.fromarray(np.stack(results, axis=-1))
 
 
 class DitherApp:
@@ -104,7 +186,8 @@ class DitherApp:
         self.mode_var = tk.StringVar(value="Color")
         self.bins_var = tk.IntVar(value=2)
         self.algorithm_var = tk.StringVar(value="Floyd-Steinberg")
-        self.status_var = tk.StringVar(value="Open an image to begin.")
+        _mode = "exact (Numba)" if _NUMBA else "fast (install numba for exact)"
+        self.status_var = tk.StringVar(value=f"Open an image to begin.\nMode: {_mode}")
         self._zoom_factor = None
 
         self._q = queue.Queue()
@@ -116,6 +199,7 @@ class DitherApp:
 
         self._build_ui()
         self.root.bind("<Configure>", self._on_resize)
+        threading.Thread(target=_prewarm_numba, daemon=True).start()
 
     def _build_ui(self):
         self.root.columnconfigure(0, weight=0)
@@ -326,7 +410,8 @@ class DitherApp:
         self._btn_dither.config(state="disabled")
         self._btn_open.config(state="disabled")
         self._btn_cancel.config(state="normal")
-        self.status_var.set("Dithering…")
+        _mode = "exact" if _NUMBA else "fast"
+        self.status_var.set(f"Dithering ({_mode})…")
 
         self._worker = threading.Thread(
             target=self._dither_worker,
