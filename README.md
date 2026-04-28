@@ -9,8 +9,11 @@ Apply error-diffusion dithering algorithms to images with a live side-by-side co
 - Color or greyscale dithering
 - Adjustable quantization bins / levels (2–64)
 - Four algorithms: Floyd-Steinberg, Jarvis/Judice/Ninke, Stucki, Burkes
+- **Exact error diffusion** with Numba JIT (install `numba` for correct same-row propagation; falls back to fast NumPy approximation without it)
+- **Parallel R/G/B processing** — all three color channels dither simultaneously on separate CPU cores
 - Non-blocking: dithering runs in a background thread; UI stays responsive
 - Progress bar + Cancel button — stop any job within one scanline
+- Status bar shows active mode: `exact (Numba)` or `fast`
 - Stacked original / dithered preview panels with synchronized scrolling
 - Zoom controls: preset steps via `+`/`−`, or type any percentage directly
 - Save result as PNG or JPEG
@@ -26,7 +29,8 @@ Apply error-diffusion dithering algorithms to images with a live side-by-side co
 ## Requirements
 
 ```bash
-pip install pillow numpy
+pip install pillow numpy          # required
+pip install numba                 # optional — enables exact diffusion mode
 ```
 
 Tkinter ships with most standard Python installs.

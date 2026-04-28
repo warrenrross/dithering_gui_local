@@ -55,6 +55,62 @@ The core dithering loop (`diffuse_channel` in `dither_gui.py`) is still a pure P
 
 ---
 
+## Session: 2026-04-28 (session 3)
+
+### Problems identified at start of session
+
+- `diffuse_channel_fast` skips same-row (dy=0) error propagation — produces correct output values but the dithering pattern differs from the true sequential algorithm (especially visible in flat regions at bins=2).
+- R, G, B channels processed sequentially: color dithering takes ~3× as long as grayscale with no concurrency.
+
+---
+
+### Changes made
+
+#### 1. `diffuse_channel_exact` (new primary function)
+- Numba `@njit(cache=True, nogil=True)` compiles `_process_row_exact` — the sequential per-pixel loop runs as native code, so dy=0 (same-row right-neighbor) errors correctly accumulate into the next pixel before it is quantized.
+- **Key `nogil=True` discovery**: without this flag, Numba holds the Python GIL. The three channel threads in `ThreadPoolExecutor` queue up and there is zero parallel speedup. With `nogil=True`, threads genuinely run on separate cores.
+- Fallback: if `import numba` fails, `diffuse_channel_exact` delegates to `diffuse_channel_fast` transparently.
+- `diffuse_channel_fast` retained unchanged as the no-Numba path.
+
+#### 2. `_prewarm_numba()` startup JIT compilation
+- Daemon thread started in `DitherApp.__init__` immediately calls `diffuse_channel_exact` on a 4×4 dummy array.
+- Numba's `cache=True` writes the compiled binary to `__pycache__`; subsequent app launches skip recompilation entirely.
+- First-ever launch (empty cache) warms up before the user typically opens an image.
+
+#### 3. `dither_image` color branch — `ThreadPoolExecutor(max_workers=3)`
+- R, G, B channels submitted as three `Future`s; with `nogil=True` they execute on separate cores.
+- Thread-safe progress: each channel's `_fn` callback acquires a `threading.Lock`, increments a shared `_tally`, then calls the caller's `progress_fn(tally, total)`. This serializes all three threads' progress signals before they reach the `queue.Queue`.
+- Cancellation: `cancel_event` is shared; setting it once stops all three channels within their next scanline.
+- If any future returns `None` (cancelled), `dither_image` returns `None`; the `with ThreadPoolExecutor()` block waits for the remaining futures to exit cleanly.
+
+#### 4. UI status bar updated
+- Startup message: `"Open an image to begin.\nMode: exact (Numba)"` or `"…fast (install numba for exact)"`.
+- While running: `"Dithering (exact)…"` or `"Dithering (fast)…"`.
+
+---
+
+### Benchmarks
+
+| Workload | Before | After |
+|---|---|---|
+| 512×512 single channel | ~3.7ms (approx) | ~3.7ms (exact) |
+| 512×512 RGB sequential | ~11ms | n/a (now parallel) |
+| 512×512 RGB parallel | — | **~6.3ms** (~1.7×) |
+| 2000×2000 RGB parallel | ~220ms sequential | **~79ms** (~2.8×) |
+
+---
+
+### Tests run (inline, no test file)
+- All four algorithms: correct dtype, shape, range ✓
+- bins=2 exact: strictly {0, 255} ✓
+- Cancel event stops worker ✓
+- Parallel color returns valid PIL Image ✓
+- Parallel cancel returns `None` ✓
+- Progress calls monotone across parallel threads ✓
+- Numba available flag: True ✓
+
+---
+
 ## Session: 2026-04-28 (session 2)
 
 ### Problems identified at start of session
