@@ -52,3 +52,58 @@ The core dithering loop (`diffuse_channel` in `dither_gui.py`) is still a pure P
 1. Vectorize the loop using NumPy (eliminates the performance problem).
 2. Run dithering in a background thread with `threading.Thread` + `queue.Queue` (keeps UI responsive during processing).
 3. Debounce the `<Configure>` resize event with Tkinter's `after()` / `after_cancel()` (reduces redundant redraws on window drag).
+
+---
+
+## Session: 2026-04-28 (session 2)
+
+### Problems identified at start of session
+
+- All three performance fixes from `dither_fix_guide_v1.md` remained unimplemented.
+- No git repo; no way to track or share code.
+- `dither_app.tar.gz` (old Perplexity-generated snapshot) was taking up space.
+
+---
+
+### Changes made
+
+#### 1. Git initialization and GitHub push
+- `git init`, created `.gitignore` (excludes `__pycache__`, `*.pyc`, `.DS_Store`, `*.dmg`, venv)
+- Two commits pushed to `https://github.com/warrenrross/dithering_gui_local`
+  - Commit 1 (`cbcff9b`): initial state (session 1 code)
+  - Commit 2 (`a2430c0`): all three performance fixes
+
+#### 2. Scanline NumPy core (`diffuse_channel_fast`)
+- Replaced `diffuse_channel` (double Python pixel loop, O(W×H) Python iterations) with a scanline approach: outer `for y` loop in Python, all per-pixel work done with NumPy slice operations inside each row.
+- Performance: 512×512 single channel drops from ~minutes to **~3ms**.
+- **Bug found in reference guide**: the guide's example writes same-row (dy=0) error propagation back into `arr[y]` after those pixels have already been quantized. This creates intermediate pixel values (e.g. 28, 199) instead of correct quantized levels (0 or 255 for bins=2). Only 1.6% of output pixels were binary instead of the expected ~100%.
+- **Fix**: two separate arrays — `buf` (accumulates inter-row errors only) and `out` (receives clean quantized values). dy=0 offsets are skipped. Inter-row propagation (dy≥1) is unaffected and remains correct.
+- `cancel_event: threading.Event` checked at each scanline; `progress_fn(y, h)` callback fires each row.
+
+#### 3. Background threading
+- `run_dither` spawns a daemon `threading.Thread`.
+- Worker function `_dither_worker` calls `dither_image` with cancel event and progress callback that puts `("progress", pct)` messages into `queue.Queue`.
+- Terminal messages: `("done", image)`, `("cancelled", None)`, `("error", str)`.
+- `_poll_queue` runs every 50ms via `root.after`; drains the queue and updates UI. All Tkinter widget writes are on the main thread only.
+- Open/Dither buttons disabled while job runs; Cancel enabled; all restored on job completion.
+
+#### 4. Cancel button and progress bar
+- New Cancel button (initially disabled); activates when a job starts, calls `cancel_event.set()`.
+- `ttk.Progressbar` (determinate, 0–100) fills as each scanline completes; resets to 0 on cancel/error.
+- UI grid renumbered to accommodate new controls between Dither and Save buttons.
+
+#### 5. Resize debounce
+- `_on_resize` now restarts a 200ms `after()` timer on every `<Configure>` event (`after_cancel()` first if one was pending).
+- `_handle_resize_done` fires once after dragging stops and calls `_refresh_panels`.
+
+---
+
+### Tests run (inline, no test file)
+- All four algorithms: correct dtype (`uint8`), shape, range [0, 255] ✓
+- Cancel event: returns `None` immediately ✓
+- bins=2 output: all values are 0 or 255 (no intermediate corruption) ✓
+- bins=4 output: exactly 4 distinct levels ✓
+- Progress callback: fires 0→95 range across scanlines ✓
+- `dither_image` grayscale and color: returns valid PIL Image ✓
+- `dither_image` color cancel: returns `None` ✓
+- 512×512 FS timing: 3ms ✓

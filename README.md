@@ -9,6 +9,8 @@ Apply error-diffusion dithering algorithms to images with a live side-by-side co
 - Color or greyscale dithering
 - Adjustable quantization bins / levels (2–64)
 - Four algorithms: Floyd-Steinberg, Jarvis/Judice/Ninke, Stucki, Burkes
+- Non-blocking: dithering runs in a background thread; UI stays responsive
+- Progress bar + Cancel button — stop any job within one scanline
 - Stacked original / dithered preview panels with synchronized scrolling
 - Zoom controls: preset steps via `+`/`−`, or type any percentage directly
 - Save result as PNG or JPEG
@@ -17,8 +19,9 @@ Apply error-diffusion dithering algorithms to images with a live side-by-side co
 
 1. **Open Image** — loads a preview; no processing yet
 2. Select Mode, Bins, and Algorithm
-3. **Dither Image** — runs the algorithm; view result below original
-4. **Save Dithered As…** — export when satisfied
+3. **Dither Image** — runs in the background; progress bar shows completion
+4. **Cancel** — stops the job at any time (within one scanline)
+5. **Save Dithered As…** — export when satisfied
 
 ## Requirements
 
