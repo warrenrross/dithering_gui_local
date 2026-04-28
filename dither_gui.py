@@ -1,4 +1,6 @@
 import os
+import queue
+import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from PIL import Image, ImageTk, ImageOps
@@ -26,42 +28,65 @@ ALGORITHMS = {
 ZOOM_STEPS = [0.25, 0.33, 0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0]
 
 
-def quantize_levels(values, bins):
-    bins = max(2, int(bins))
-    levels = np.linspace(0, 255, bins, dtype=np.float32)
-    idx = np.abs(values[..., None] - levels).argmin(axis=-1)
-    return levels[idx]
+def diffuse_channel_fast(channel, algo_name, bins, cancel_event=None, progress_fn=None):
+    """Scanline-based NumPy error diffusion. Returns uint8 array, or None if cancelled.
 
-
-def diffuse_channel(channel, algo_name, bins):
+    Uses a separate accumulator (buf) and output (out) so that same-row error
+    additions never corrupt already-quantized output pixels. Same-row (dy==0)
+    offsets are skipped; inter-row propagation is exact.
+    """
     kernel = ALGORITHMS[algo_name]
-    arr = channel.astype(np.float32).copy()
-    h, w = arr.shape
+    offsets = [(dx, dy, w / kernel["divisor"]) for dx, dy, w in kernel["offsets"]]
+
+    buf = channel.astype(np.float32) / 255.0   # accumulates inter-row errors
+    out = np.empty_like(buf)                    # receives clean quantized values
+    h, w = buf.shape
+    levels = max(2, int(bins)) - 1
+
     for y in range(h):
-        for x in range(w):
-            old = arr[y, x]
-            new = quantize_levels(np.array([[old]], dtype=np.float32), bins)[0, 0]
-            err = old - new
-            arr[y, x] = new
-            for dx, dy, weight in kernel["offsets"]:
-                nx, ny = x + dx, y + dy
-                if 0 <= nx < w and 0 <= ny < h:
-                    arr[ny, nx] += err * (weight / kernel["divisor"])
-    return np.clip(arr, 0, 255).astype(np.uint8)
+        if cancel_event is not None and cancel_event.is_set():
+            return None
+        if progress_fn is not None:
+            progress_fn(y, h)
+
+        old_row = buf[y].copy()
+        quantized = np.round(old_row * levels) / levels
+        err = old_row - quantized
+        out[y] = quantized
+
+        for dx, dy, weight in offsets:
+            if dy == 0:
+                continue          # same-row: skip to avoid corrupting out[y]
+            ny = y + dy
+            if ny < 0 or ny >= h:
+                continue
+            if dx == 0:
+                buf[ny, :] += err * weight
+            elif dx > 0:
+                buf[ny, dx:] += err[:-dx] * weight
+            else:
+                buf[ny, :dx] += err[-dx:] * weight
+
+    return np.clip(out * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
 
-def dither_image(image, grayscale, bins, algo_name):
+def dither_image(image, grayscale, bins, algo_name, cancel_event=None, progress_fn=None):
+    """Dither a PIL Image. Returns PIL Image, or None if cancelled."""
     if grayscale:
-        gray = ImageOps.grayscale(image)
-        channel = np.array(gray, dtype=np.uint8)
-        out = diffuse_channel(channel, algo_name, bins)
-        return Image.fromarray(out)
+        channel = np.array(ImageOps.grayscale(image), dtype=np.uint8)
+        out = diffuse_channel_fast(channel, algo_name, bins, cancel_event, progress_fn)
+        return None if out is None else Image.fromarray(out)
 
-    rgb = image.convert("RGB")
-    arr = np.array(rgb, dtype=np.uint8)
-    channels = [diffuse_channel(arr[:, :, i], algo_name, bins) for i in range(3)]
-    merged = np.stack(channels, axis=-1)
-    return Image.fromarray(merged)
+    arr = np.array(image.convert("RGB"), dtype=np.uint8)
+    channels = []
+    for i in range(3):
+        ch_fn = (None if progress_fn is None
+                 else (lambda y, h, _i=i: progress_fn(_i * h + y, 3 * h)))
+        out = diffuse_channel_fast(arr[:, :, i], algo_name, bins, cancel_event, ch_fn)
+        if out is None:
+            return None
+        channels.append(out)
+    return Image.fromarray(np.stack(channels, axis=-1))
 
 
 class DitherApp:
@@ -80,7 +105,14 @@ class DitherApp:
         self.bins_var = tk.IntVar(value=2)
         self.algorithm_var = tk.StringVar(value="Floyd-Steinberg")
         self.status_var = tk.StringVar(value="Open an image to begin.")
-        self._zoom_factor = None  # None = fit mode
+        self._zoom_factor = None
+
+        self._q = queue.Queue()
+        self._cancel_event = None
+        self._worker = None
+        self._poll_id = None
+        self._resize_after_id = None
+        self._progress_var = tk.IntVar(value=0)
 
         self._build_ui()
         self.root.bind("<Configure>", self._on_resize)
@@ -98,31 +130,41 @@ class DitherApp:
         ttk.Label(controls, text="Image Dithering", font=("TkDefaultFont", 14, "bold")).grid(
             row=0, column=0, sticky="w", pady=(0, 12))
 
-        ttk.Button(controls, text="Open Image…",      command=self.open_image).grid(row=1, column=0, sticky="ew", pady=2)
-        ttk.Button(controls, text="Dither Image",     command=self.run_dither).grid(row=2, column=0, sticky="ew", pady=2)
-        ttk.Button(controls, text="Save Dithered As…", command=self.save_image).grid(row=3, column=0, sticky="ew", pady=2)
+        self._btn_open   = ttk.Button(controls, text="Open Image…",       command=self.open_image)
+        self._btn_dither = ttk.Button(controls, text="Dither Image",      command=self.run_dither)
+        self._btn_cancel = ttk.Button(controls, text="Cancel",            command=self._cancel_dither, state="disabled")
+        self._btn_save   = ttk.Button(controls, text="Save Dithered As…", command=self.save_image)
+        self._btn_open.grid(  row=1, column=0, sticky="ew", pady=2)
+        self._btn_dither.grid(row=2, column=0, sticky="ew", pady=2)
+        self._btn_cancel.grid(row=3, column=0, sticky="ew", pady=2)
 
-        ttk.Separator(controls).grid(row=4, column=0, sticky="ew", pady=12)
+        self._progress_bar = ttk.Progressbar(
+            controls, variable=self._progress_var, maximum=100, length=200)
+        self._progress_bar.grid(row=4, column=0, sticky="ew", pady=(2, 8))
 
-        ttk.Label(controls, text="Mode").grid(row=5, column=0, sticky="w")
-        ttk.Radiobutton(controls, text="Color",     variable=self.mode_var, value="Color").grid(    row=6, column=0, sticky="w")
-        ttk.Radiobutton(controls, text="Greyscale", variable=self.mode_var, value="Greyscale").grid(row=7, column=0, sticky="w")
+        self._btn_save.grid(row=5, column=0, sticky="ew", pady=2)
 
-        ttk.Label(controls, text="Color bins / grey levels").grid(row=8, column=0, sticky="w", pady=(12, 0))
+        ttk.Separator(controls).grid(row=6, column=0, sticky="ew", pady=12)
+
+        ttk.Label(controls, text="Mode").grid(row=7, column=0, sticky="w")
+        ttk.Radiobutton(controls, text="Color",     variable=self.mode_var, value="Color").grid(    row=8,  column=0, sticky="w")
+        ttk.Radiobutton(controls, text="Greyscale", variable=self.mode_var, value="Greyscale").grid(row=9,  column=0, sticky="w")
+
+        ttk.Label(controls, text="Color bins / grey levels").grid(row=10, column=0, sticky="w", pady=(12, 0))
         ttk.Spinbox(controls, from_=2, to=64, textvariable=self.bins_var, width=8).grid(
-            row=9, column=0, sticky="w", pady=(4, 4))
+            row=11, column=0, sticky="w", pady=(4, 4))
         ttk.Label(controls, text="Lower = stronger dithering\nHigher = more tones",
-                  foreground="#555").grid(row=10, column=0, sticky="w")
+                  foreground="#555").grid(row=12, column=0, sticky="w")
 
-        ttk.Label(controls, text="Algorithm").grid(row=11, column=0, sticky="w", pady=(12, 0))
+        ttk.Label(controls, text="Algorithm").grid(row=13, column=0, sticky="w", pady=(12, 0))
         ttk.Combobox(controls, textvariable=self.algorithm_var, state="readonly",
-                     values=list(ALGORITHMS.keys()), width=28).grid(row=12, column=0, sticky="ew", pady=(4, 4))
+                     values=list(ALGORITHMS.keys()), width=28).grid(row=14, column=0, sticky="ew", pady=(4, 4))
 
-        ttk.Separator(controls).grid(row=13, column=0, sticky="ew", pady=12)
+        ttk.Separator(controls).grid(row=15, column=0, sticky="ew", pady=12)
 
-        ttk.Label(controls, text="Zoom").grid(row=14, column=0, sticky="w")
+        ttk.Label(controls, text="Zoom").grid(row=16, column=0, sticky="w")
         zoom_frame = ttk.Frame(controls)
-        zoom_frame.grid(row=15, column=0, sticky="w", pady=(4, 0))
+        zoom_frame.grid(row=17, column=0, sticky="w", pady=(4, 0))
         ttk.Button(zoom_frame, text="−", width=3, command=self._zoom_out).pack(side="left")
         self._zoom_entry_var = tk.StringVar(value="Fit")
         zoom_entry = ttk.Entry(zoom_frame, textvariable=self._zoom_entry_var, width=6, justify="center")
@@ -132,9 +174,9 @@ class DitherApp:
         ttk.Button(zoom_frame, text="+", width=3, command=self._zoom_in).pack(side="left")
         ttk.Button(zoom_frame, text="Fit", command=self._zoom_reset).pack(side="left", padx=(8, 0))
 
-        ttk.Separator(controls).grid(row=16, column=0, sticky="ew", pady=12)
+        ttk.Separator(controls).grid(row=18, column=0, sticky="ew", pady=12)
         ttk.Label(controls, textvariable=self.status_var, wraplength=240,
-                  justify="left").grid(row=17, column=0, sticky="w")
+                  justify="left").grid(row=19, column=0, sticky="w")
 
         # ── Preview panel ─────────────────────────────────────────────────
         preview = ttk.Frame(self.root, padding=14)
@@ -160,7 +202,6 @@ class DitherApp:
         self.vsb.grid(row=1, column=1, rowspan=3, sticky="ns")
         self.hsb.grid(row=4, column=0, sticky="ew")
 
-        # canvas_orig drives the scrollbars and keeps canvas_proc in sync
         self.canvas_orig.configure(
             yscrollcommand=self._yscroll_sync,
             xscrollcommand=self._xscroll_sync,
@@ -236,7 +277,7 @@ class DitherApp:
                 pct = float(raw)
                 self._zoom_factor = max(0.01, min(pct / 100.0, 32.0))
             except ValueError:
-                pass  # leave zoom unchanged, reset display below
+                pass
         self._apply_zoom()
 
     def _apply_zoom(self):
@@ -272,18 +313,90 @@ class DitherApp:
     def run_dither(self):
         if self.original_image is None:
             return
+        if self._worker is not None and self._worker.is_alive():
+            return
+
+        bins = max(2, min(64, int(self.bins_var.get())))
+        self.bins_var.set(bins)
+        grayscale = self.mode_var.get() == "Greyscale"
+        algo = self.algorithm_var.get()
+
+        self._cancel_event = threading.Event()
+        self._progress_var.set(0)
+        self._btn_dither.config(state="disabled")
+        self._btn_open.config(state="disabled")
+        self._btn_cancel.config(state="normal")
+        self.status_var.set("Dithering…")
+
+        self._worker = threading.Thread(
+            target=self._dither_worker,
+            args=(self.original_image.copy(), grayscale, bins, algo),
+            daemon=True,
+        )
+        self._worker.start()
+        self._poll_queue()
+
+    def _dither_worker(self, image, grayscale, bins, algo_name):
         try:
-            bins = max(2, min(64, int(self.bins_var.get())))
-            self.bins_var.set(bins)
-            grayscale = self.mode_var.get() == "Greyscale"
-            self.processed_image = dither_image(
-                self.original_image, grayscale, bins, self.algorithm_var.get())
-            self._refresh_panels()
-            mode = "greyscale" if grayscale else "color"
-            self.status_var.set(
-                f"Done: {self.algorithm_var.get()} | {mode} | {bins} bins")
+            last_pct = [-1]
+
+            def progress_fn(done, total):
+                pct = int(done * 100 / total) if total > 0 else 0
+                if pct > last_pct[0]:
+                    last_pct[0] = pct
+                    self._q.put(("progress", pct))
+
+            result = dither_image(image, grayscale, bins, algo_name, self._cancel_event, progress_fn)
+            if result is None:
+                self._q.put(("cancelled", None))
+            else:
+                self._q.put(("done", result))
         except Exception as exc:
-            messagebox.showerror("Dither image", f"Could not process image:\n{exc}")
+            self._q.put(("error", str(exc)))
+
+    def _poll_queue(self):
+        try:
+            while True:
+                kind, payload = self._q.get_nowait()
+                if kind == "progress":
+                    self._progress_var.set(payload)
+                elif kind == "done":
+                    self.processed_image = payload
+                    self._refresh_panels()
+                    mode = "greyscale" if self.mode_var.get() == "Greyscale" else "color"
+                    self.status_var.set(
+                        f"Done: {self.algorithm_var.get()} | {mode} | {self.bins_var.get()} bins")
+                    self._progress_var.set(100)
+                    self._reset_controls()
+                    return
+                elif kind == "cancelled":
+                    self.status_var.set("Cancelled.")
+                    self._progress_var.set(0)
+                    self._reset_controls()
+                    return
+                elif kind == "error":
+                    messagebox.showerror("Dither image", f"Could not process image:\n{payload}")
+                    self.status_var.set("Error during dithering.")
+                    self._progress_var.set(0)
+                    self._reset_controls()
+                    return
+        except queue.Empty:
+            pass
+
+        if self._worker and self._worker.is_alive():
+            self._poll_id = self.root.after(50, self._poll_queue)
+        else:
+            self._poll_id = None
+            self._reset_controls()
+
+    def _reset_controls(self):
+        self._btn_dither.config(state="normal")
+        self._btn_open.config(state="normal")
+        self._btn_cancel.config(state="disabled")
+
+    def _cancel_dither(self):
+        if self._cancel_event is not None:
+            self._cancel_event.set()
 
     def save_image(self):
         if self.processed_image is None:
@@ -309,6 +422,12 @@ class DitherApp:
     # ── Display ────────────────────────────────────────────────────────────
 
     def _on_resize(self, event=None):
+        if self._resize_after_id is not None:
+            self.root.after_cancel(self._resize_after_id)
+        self._resize_after_id = self.root.after(200, self._handle_resize_done)
+
+    def _handle_resize_done(self):
+        self._resize_after_id = None
         if self.original_image is not None:
             self._refresh_panels()
 
@@ -317,7 +436,6 @@ class DitherApp:
             return
 
         if self._zoom_factor is None:
-            # Fit mode: compute a shared display size from whichever canvas is smaller
             self.canvas_orig.update_idletasks()
             self.canvas_proc.update_idletasks()
             cw = max(min(self.canvas_orig.winfo_width(),  self.canvas_proc.winfo_width()),  100)
